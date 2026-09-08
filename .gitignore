@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.py[cod]
+qna.sqlite3
+.env
