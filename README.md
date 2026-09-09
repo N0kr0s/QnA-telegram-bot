@@ -1,3 +1,96 @@
+# Anonymous Q&A Bot
+
+A local Telegram bot for receiving anonymous messages through a personal link.
+
+Each owner gets a link in the following format:
+
+```
+https://t.me/<bot_username>?start=<token>
+```
+
+Another user opens the link, sends a message, and the bot delivers it to the owner. The owner receives the message from the bot and cannot see the sender's Telegram profile.
+
+## Features
+
+* a personal link for each user;
+* persistent storage of links and sessions in SQLite;
+* disabling and regenerating personal links;
+* support for text, photos, videos, voice messages, video notes, audio files, documents, GIFs, animations, and stickers;
+* support for contacts, locations, venues, polls, and dice emojis;
+* message length limit of 2000 characters;
+* message rate limiting;
+* handling of invalid and disabled links;
+* owner replies through Telegram Reply on anonymous messages;
+* replies can contain text or any supported media type.
+
+## Requirements
+
+* Python 3.12 or newer;
+* a Telegram bot created through [@BotFather](https://t.me/BotFather).
+
+## Installation
+
+Create a virtual environment and install the dependencies:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the project root:
+
+```dotenv
+BOT_TOKEN=token_from_BotFather
+```
+
+## Running
+
+```bash
+python main.py
+```
+
+The bot uses long polling. The `qna.sqlite3` database is created automatically on the first launch.
+
+## Commands
+
+| Command    | Action                                         |
+| ---------- | ---------------------------------------------- |
+| `/start`   | Show the active personal link or create one    |
+| `/link`    | Create a new personal link                     |
+| `/disable` | Disable all active links                       |
+| `/enable`  | Create a new active link                       |
+| `/cancel`  | Clear the currently selected message recipient |
+| `/help`    | Show help                                      |
+
+## Testing
+
+A full test requires two Telegram accounts:
+
+1. Open the bot with the first account and send `/start`.
+2. Copy the generated link.
+3. Open the link with the second account.
+4. Send a text message.
+5. Make sure the message is delivered to the link owner from the bot.
+6. Reply to the received message using Telegram Reply.
+7. Make sure the reply is delivered to the sender without exposing the sender's profile to the owner.
+
+## MVP Limitations
+
+* media albums are delivered as separate messages;
+* Telegram system messages and unsupported entities are not forwarded;
+* a local SQLite database is used.
+
+## Anonymity Risks
+
+* The bot technically receives the Telegram IDs of both the sender and the owner, so complete anonymity from Telegram, the server owner, and the developer cannot be guaranteed.
+* `qna.sqlite3` stores the sender, the owner, the question content, and its delivery history. This allows the server owner to reconstruct the connection between users.
+* To support Reply, the bot temporarily stores a link between the owner's notification message and the original sender. This temporary mapping is deleted after the reply is successfully delivered, but the main question record remains in SQLite.
+* The text and content of the owner's reply are not stored separately in SQLite, although Telegram and server logs may temporarily contain them.
+* The owner may be able to indirectly identify the sender based on writing style, message content, timing, and the sequence of replies.
+* Telegram can see the participants and messages passing through the bot.
+* Access to the server, database file, or logs may expose senders, owners, and message history.
+* Replies are sent on behalf of the bot, but Telegram may show the sender that the response is a Reply to their original message.
 # Анонимный Q&A-бот
 
 Локальный Telegram-бот для приема анонимных текстовых сообщений по персональной ссылке.
