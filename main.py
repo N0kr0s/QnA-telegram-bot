@@ -9,7 +9,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, ReplyParameters
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
@@ -22,6 +22,7 @@ MAX_CAPTION_LENGTH = 900
 MAX_MEDIA_SIZE_BYTES = 50 * 1024 * 1024
 RATE_LIMIT_SECONDS = 10
 ANONYMOUS_HEADER = "📨 Анонимное сообщение"
+ANSWER_HEADER = "📬 Ответ на ваше анонимное сообщение"
 
 SUPPORTED_CONTENT_TYPES = {
     "text",
@@ -106,6 +107,20 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_messages_sender_time
                 ON messages(sender_telegram_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS reply_targets (
+                owner_chat_id INTEGER NOT NULL,
+                owner_message_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                sender_chat_id INTEGER NOT NULL,
+                sender_message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_chat_id, owner_message_id),
+                FOREIGN KEY (question_id) REFERENCES messages(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reply_targets_question
+                ON reply_targets(question_id);
             """
         )
 
@@ -229,9 +244,9 @@ def save_message(
     media_group_id: str | None = None,
     metadata: dict | None = None,
     telegram_message_id: int | None = None,
-) -> None:
+) -> int:
     with connect_db() as connection:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO messages (link_id, sender_telegram_id, recipient_telegram_id, text, "
             "content_type, file_id, file_unique_id, caption, file_name, mime_type, media_group_id, "
             "metadata_json, telegram_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -252,6 +267,47 @@ def save_message(
                 now(),
             ),
         )
+        return cursor.lastrowid
+
+
+def save_reply_targets(
+    question_id: int,
+    owner_chat_id: int,
+    owner_message_ids: list[int],
+    sender_chat_id: int,
+    sender_message_id: int,
+) -> None:
+    with connect_db() as connection:
+        connection.executemany(
+            "INSERT OR REPLACE INTO reply_targets "
+            "(owner_chat_id, owner_message_id, question_id, sender_chat_id, sender_message_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    owner_chat_id,
+                    owner_message_id,
+                    question_id,
+                    sender_chat_id,
+                    sender_message_id,
+                    now(),
+                )
+                for owner_message_id in owner_message_ids
+            ],
+        )
+
+
+def get_reply_target(owner_chat_id: int, owner_message_id: int) -> sqlite3.Row | None:
+    with connect_db() as connection:
+        return connection.execute(
+            "SELECT question_id, sender_chat_id, sender_message_id "
+            "FROM reply_targets WHERE owner_chat_id = ? AND owner_message_id = ?",
+            (owner_chat_id, owner_message_id),
+        ).fetchone()
+
+
+def delete_reply_targets(question_id: int) -> None:
+    with connect_db() as connection:
+        connection.execute("DELETE FROM reply_targets WHERE question_id = ?", (question_id,))
 
 
 def link_url(username: str, token: str) -> str:
@@ -354,10 +410,10 @@ def normalized_content_type(message: Message) -> str:
     return value.lower().split(".")[-1]
 
 
-def caption_for_delivery(caption: str | None) -> str:
+def caption_for_delivery(caption: str | None, header: str = ANONYMOUS_HEADER) -> str:
     if not caption:
-        return ANONYMOUS_HEADER
-    return f"{ANONYMOUS_HEADER}\n\n{caption}"
+        return header
+    return f"{header}\n\n{caption}"
 
 
 def media_object(message: Message, content_type: str):
@@ -366,47 +422,56 @@ def media_object(message: Message, content_type: str):
     return getattr(message, content_type, None)
 
 
-async def send_anonymous_message(message: Message, recipient_id: int, content_type: str):
+async def send_anonymous_message(
+    message: Message,
+    recipient_id: int,
+    content_type: str,
+    *,
+    header: str = ANONYMOUS_HEADER,
+    reply_parameters: ReplyParameters | None = None,
+):
     bot = message.bot
     caption = getattr(message, "caption", None)
-    caption_text = caption_for_delivery(caption)
+    caption_text = caption_for_delivery(caption, header)
+    reply_kwargs = {"reply_parameters": reply_parameters} if reply_parameters else {}
 
     if content_type == "text":
-        return [await bot.send_message(recipient_id, f"{ANONYMOUS_HEADER}:\n\n{message.text}")]
+        return [await bot.send_message(recipient_id, f"{header}:\n\n{message.text}", **reply_kwargs)]
     if content_type == "photo":
-        return [await bot.send_photo(recipient_id, message.photo[-1].file_id, caption=caption_text)]
+        return [await bot.send_photo(recipient_id, message.photo[-1].file_id, caption=caption_text, **reply_kwargs)]
     if content_type == "video":
-        return [await bot.send_video(recipient_id, message.video.file_id, caption=caption_text)]
+        return [await bot.send_video(recipient_id, message.video.file_id, caption=caption_text, **reply_kwargs)]
     if content_type == "voice":
-        return [await bot.send_voice(recipient_id, message.voice.file_id, caption=caption_text)]
+        return [await bot.send_voice(recipient_id, message.voice.file_id, caption=caption_text, **reply_kwargs)]
     if content_type == "audio":
-        return [await bot.send_audio(recipient_id, message.audio.file_id, caption=caption_text)]
+        return [await bot.send_audio(recipient_id, message.audio.file_id, caption=caption_text, **reply_kwargs)]
     if content_type == "document":
-        return [await bot.send_document(recipient_id, message.document.file_id, caption=caption_text)]
+        return [await bot.send_document(recipient_id, message.document.file_id, caption=caption_text, **reply_kwargs)]
     if content_type == "animation":
-        return [await bot.send_animation(recipient_id, message.animation.file_id, caption=caption_text)]
+        return [await bot.send_animation(recipient_id, message.animation.file_id, caption=caption_text, **reply_kwargs)]
     if content_type == "video_note":
-        media = await bot.send_video_note(recipient_id, message.video_note.file_id)
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
-        return [media, header]
+        media = await bot.send_video_note(recipient_id, message.video_note.file_id, **reply_kwargs)
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
+        return [media, header_message]
     if content_type == "sticker":
-        media = await bot.send_sticker(recipient_id, message.sticker.file_id)
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
-        return [media, header]
+        media = await bot.send_sticker(recipient_id, message.sticker.file_id, **reply_kwargs)
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
+        return [media, header_message]
     if content_type == "contact":
         contact = message.contact
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
         media = await bot.send_contact(
             recipient_id,
             phone_number=contact.phone_number,
             first_name=contact.first_name,
             last_name=contact.last_name,
             vcard=contact.vcard,
+            **reply_kwargs,
         )
-        return [header, media]
+        return [header_message, media]
     if content_type == "location":
         location = message.location
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
         media = await bot.send_location(
             recipient_id,
             latitude=location.latitude,
@@ -415,11 +480,12 @@ async def send_anonymous_message(message: Message, recipient_id: int, content_ty
             live_period=location.live_period,
             heading=location.heading,
             proximity_alert_radius=location.proximity_alert_radius,
+            **reply_kwargs,
         )
-        return [header, media]
+        return [header_message, media]
     if content_type == "venue":
         venue = message.venue
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
         media = await bot.send_venue(
             recipient_id,
             latitude=venue.location.latitude,
@@ -430,11 +496,12 @@ async def send_anonymous_message(message: Message, recipient_id: int, content_ty
             foursquare_type=venue.foursquare_type,
             google_place_id=venue.google_place_id,
             google_place_type=venue.google_place_type,
+            **reply_kwargs,
         )
-        return [header, media]
+        return [header_message, media]
     if content_type == "poll":
         poll = message.poll
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
         kwargs = {
             "chat_id": recipient_id,
             "question": poll.question,
@@ -443,17 +510,66 @@ async def send_anonymous_message(message: Message, recipient_id: int, content_ty
             "type": poll.type,
             "allows_multiple_answers": poll.allows_multiple_answers,
         }
+        kwargs.update(reply_kwargs)
         if poll.type == "quiz" and poll.correct_option_id is not None:
             kwargs["correct_option_id"] = poll.correct_option_id
             kwargs["explanation"] = poll.explanation
         media = await bot.send_poll(**kwargs)
-        return [header, media]
+        return [header_message, media]
     if content_type == "dice":
-        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
-        media = await bot.send_dice(recipient_id, emoji=message.dice.emoji)
-        return [header, media]
+        header_message = await bot.send_message(recipient_id, header, **reply_kwargs)
+        media = await bot.send_dice(recipient_id, emoji=message.dice.emoji, **reply_kwargs)
+        return [header_message, media]
 
     raise ValueError(f"Unsupported content type: {content_type}")
+
+
+@router.message(F.chat.type == "private", F.reply_to_message)
+async def reply_to_question(message: Message) -> None:
+    if not message.from_user or not message.reply_to_message:
+        return
+
+    target = get_reply_target(message.chat.id, message.reply_to_message.message_id)
+    if not target:
+        await receive_message(message)
+        return
+
+    content_type = normalized_content_type(message)
+    if content_type not in SUPPORTED_CONTENT_TYPES:
+        await message.answer("Этот тип ответа пока не поддерживается.")
+        return
+    if content_type == "text" and (not message.text or len(message.text) > MAX_MESSAGE_LENGTH):
+        await message.answer(f"Ответ слишком длинный. Максимум: {MAX_MESSAGE_LENGTH} символов.")
+        return
+    caption = getattr(message, "caption", None)
+    if caption and len(caption) > MAX_CAPTION_LENGTH:
+        await message.answer(f"Подпись слишком длинная. Максимум: {MAX_CAPTION_LENGTH} символов.")
+        return
+
+    file = media_object(message, content_type)
+    file_size = getattr(file, "file_size", None)
+    if file_size and file_size > MAX_MEDIA_SIZE_BYTES:
+        await message.answer("Файл слишком большой. Максимальный размер: 50 МБ.")
+        return
+
+    reply_parameters = ReplyParameters(
+        message_id=target["sender_message_id"],
+        allow_sending_without_reply=True,
+    )
+    try:
+        await send_anonymous_message(
+            message,
+            target["sender_chat_id"],
+            content_type,
+            header=ANSWER_HEADER,
+            reply_parameters=reply_parameters,
+        )
+    except (TelegramForbiddenError, TelegramBadRequest, TelegramAPIError, ValueError):
+        await message.answer("Не удалось доставить ответ отправителю.")
+        return
+
+    delete_reply_targets(target["question_id"])
+    await message.answer("Ответ отправлен анонимно.")
 
 
 @router.message(F.chat.type == "private")
@@ -513,7 +629,7 @@ async def receive_message(message: Message) -> None:
     elif content_type == "photo":
         metadata = {"width": file.width, "height": file.height}
 
-    save_message(
+    question_id = save_message(
         session["link_id"],
         message.from_user.id,
         session["owner_telegram_id"],
@@ -527,6 +643,13 @@ async def receive_message(message: Message) -> None:
         media_group_id=media_group_id,
         metadata=metadata,
         telegram_message_id=sent_messages[-1].message_id,
+    )
+    save_reply_targets(
+        question_id,
+        session["owner_telegram_id"],
+        [sent_message.message_id for sent_message in sent_messages],
+        message.chat.id,
+        message.message_id,
     )
     await message.answer("Сообщение отправлено анонимно.")
 
