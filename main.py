@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -9,7 +10,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
 
@@ -17,7 +18,27 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BASE_DIR / "qna.sqlite3"
 TOKEN_LENGTH = 32
 MAX_MESSAGE_LENGTH = 2000
+MAX_CAPTION_LENGTH = 900
+MAX_MEDIA_SIZE_BYTES = 50 * 1024 * 1024
 RATE_LIMIT_SECONDS = 10
+ANONYMOUS_HEADER = "📨 Анонимное сообщение"
+
+SUPPORTED_CONTENT_TYPES = {
+    "text",
+    "photo",
+    "video",
+    "voice",
+    "video_note",
+    "audio",
+    "document",
+    "animation",
+    "sticker",
+    "contact",
+    "location",
+    "venue",
+    "poll",
+    "dice",
+}
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -69,7 +90,15 @@ def init_db() -> None:
                 link_id INTEGER NOT NULL,
                 sender_telegram_id INTEGER NOT NULL,
                 recipient_telegram_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
+                text TEXT NOT NULL DEFAULT '',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                file_id TEXT,
+                file_unique_id TEXT,
+                caption TEXT,
+                file_name TEXT,
+                mime_type TEXT,
+                media_group_id TEXT,
+                metadata_json TEXT,
                 telegram_message_id INTEGER,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (link_id) REFERENCES links(id)
@@ -79,6 +108,24 @@ def init_db() -> None:
                 ON messages(sender_telegram_id, created_at);
             """
         )
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        migrations = {
+            "content_type": "TEXT NOT NULL DEFAULT 'text'",
+            "file_id": "TEXT",
+            "file_unique_id": "TEXT",
+            "caption": "TEXT",
+            "file_name": "TEXT",
+            "mime_type": "TEXT",
+            "media_group_id": "TEXT",
+            "metadata_json": "TEXT",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                connection.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
 
 
 def now() -> int:
@@ -153,22 +200,57 @@ def get_session(sender_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def recently_sent(sender_id: int) -> bool:
+def recently_sent(sender_id: int, media_group_id: str | None = None) -> bool:
     with connect_db() as connection:
         row = connection.execute(
-            "SELECT created_at FROM messages WHERE sender_telegram_id = ? "
+            "SELECT created_at, media_group_id FROM messages WHERE sender_telegram_id = ? "
             "ORDER BY id DESC LIMIT 1",
             (sender_id,),
         ).fetchone()
-    return bool(row and now() - row["created_at"] < RATE_LIMIT_SECONDS)
+    if not row:
+        return False
+    if media_group_id and row["media_group_id"] == media_group_id:
+        return False
+    return now() - row["created_at"] < RATE_LIMIT_SECONDS
 
 
-def save_message(link_id: int, sender_id: int, recipient_id: int, text: str) -> None:
+def save_message(
+    link_id: int,
+    sender_id: int,
+    recipient_id: int,
+    *,
+    content_type: str,
+    text: str = "",
+    file_id: str | None = None,
+    file_unique_id: str | None = None,
+    caption: str | None = None,
+    file_name: str | None = None,
+    mime_type: str | None = None,
+    media_group_id: str | None = None,
+    metadata: dict | None = None,
+    telegram_message_id: int | None = None,
+) -> None:
     with connect_db() as connection:
         connection.execute(
-            "INSERT INTO messages (link_id, sender_telegram_id, recipient_telegram_id, text, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (link_id, sender_id, recipient_id, text, now()),
+            "INSERT INTO messages (link_id, sender_telegram_id, recipient_telegram_id, text, "
+            "content_type, file_id, file_unique_id, caption, file_name, mime_type, media_group_id, "
+            "metadata_json, telegram_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                link_id,
+                sender_id,
+                recipient_id,
+                text,
+                content_type,
+                file_id,
+                file_unique_id,
+                caption,
+                file_name,
+                mime_type,
+                media_group_id,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                telegram_message_id,
+                now(),
+            ),
         )
 
 
@@ -266,33 +348,186 @@ async def help_command(message: Message) -> None:
     )
 
 
-@router.message(F.chat.type == "private", F.text)
-async def receive_text(message: Message) -> None:
-    if not message.from_user or not message.text:
+def normalized_content_type(message: Message) -> str:
+    content_type = message.content_type
+    value = content_type.value if hasattr(content_type, "value") else str(content_type)
+    return value.lower().split(".")[-1]
+
+
+def caption_for_delivery(caption: str | None) -> str:
+    if not caption:
+        return ANONYMOUS_HEADER
+    return f"{ANONYMOUS_HEADER}\n\n{caption}"
+
+
+def media_object(message: Message, content_type: str):
+    if content_type == "photo":
+        return message.photo[-1] if message.photo else None
+    return getattr(message, content_type, None)
+
+
+async def send_anonymous_message(message: Message, recipient_id: int, content_type: str):
+    bot = message.bot
+    caption = getattr(message, "caption", None)
+    caption_text = caption_for_delivery(caption)
+
+    if content_type == "text":
+        return [await bot.send_message(recipient_id, f"{ANONYMOUS_HEADER}:\n\n{message.text}")]
+    if content_type == "photo":
+        return [await bot.send_photo(recipient_id, message.photo[-1].file_id, caption=caption_text)]
+    if content_type == "video":
+        return [await bot.send_video(recipient_id, message.video.file_id, caption=caption_text)]
+    if content_type == "voice":
+        return [await bot.send_voice(recipient_id, message.voice.file_id, caption=caption_text)]
+    if content_type == "audio":
+        return [await bot.send_audio(recipient_id, message.audio.file_id, caption=caption_text)]
+    if content_type == "document":
+        return [await bot.send_document(recipient_id, message.document.file_id, caption=caption_text)]
+    if content_type == "animation":
+        return [await bot.send_animation(recipient_id, message.animation.file_id, caption=caption_text)]
+    if content_type == "video_note":
+        media = await bot.send_video_note(recipient_id, message.video_note.file_id)
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        return [media, header]
+    if content_type == "sticker":
+        media = await bot.send_sticker(recipient_id, message.sticker.file_id)
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        return [media, header]
+    if content_type == "contact":
+        contact = message.contact
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        media = await bot.send_contact(
+            recipient_id,
+            phone_number=contact.phone_number,
+            first_name=contact.first_name,
+            last_name=contact.last_name,
+            vcard=contact.vcard,
+        )
+        return [header, media]
+    if content_type == "location":
+        location = message.location
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        media = await bot.send_location(
+            recipient_id,
+            latitude=location.latitude,
+            longitude=location.longitude,
+            horizontal_accuracy=location.horizontal_accuracy,
+            live_period=location.live_period,
+            heading=location.heading,
+            proximity_alert_radius=location.proximity_alert_radius,
+        )
+        return [header, media]
+    if content_type == "venue":
+        venue = message.venue
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        media = await bot.send_venue(
+            recipient_id,
+            latitude=venue.location.latitude,
+            longitude=venue.location.longitude,
+            title=venue.title,
+            address=venue.address,
+            foursquare_id=venue.foursquare_id,
+            foursquare_type=venue.foursquare_type,
+            google_place_id=venue.google_place_id,
+            google_place_type=venue.google_place_type,
+        )
+        return [header, media]
+    if content_type == "poll":
+        poll = message.poll
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        kwargs = {
+            "chat_id": recipient_id,
+            "question": poll.question,
+            "options": [option.text for option in poll.options],
+            "is_anonymous": True,
+            "type": poll.type,
+            "allows_multiple_answers": poll.allows_multiple_answers,
+        }
+        if poll.type == "quiz" and poll.correct_option_id is not None:
+            kwargs["correct_option_id"] = poll.correct_option_id
+            kwargs["explanation"] = poll.explanation
+        media = await bot.send_poll(**kwargs)
+        return [header, media]
+    if content_type == "dice":
+        header = await bot.send_message(recipient_id, ANONYMOUS_HEADER)
+        media = await bot.send_dice(recipient_id, emoji=message.dice.emoji)
+        return [header, media]
+
+    raise ValueError(f"Unsupported content type: {content_type}")
+
+
+@router.message(F.chat.type == "private")
+async def receive_message(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    content_type = normalized_content_type(message)
+    if content_type == "text" and message.text and message.text.startswith("/"):
+        await message.answer("Неизвестная команда. Используй /help для справки.")
+        return
+    if content_type not in SUPPORTED_CONTENT_TYPES:
+        await message.answer("Этот тип сообщения пока не поддерживается.")
         return
 
     session = get_session(message.from_user.id)
     if not session:
         await message.answer("Сначала открой персональную ссылку получателя.")
         return
-    if len(message.text) > MAX_MESSAGE_LENGTH:
+
+    caption = getattr(message, "caption", None)
+    if content_type == "text" and (not message.text or len(message.text) > MAX_MESSAGE_LENGTH):
         await message.answer(f"Сообщение слишком длинное. Максимум: {MAX_MESSAGE_LENGTH} символов.")
         return
-    if recently_sent(message.from_user.id):
+    if caption and len(caption) > MAX_CAPTION_LENGTH:
+        await message.answer(f"Подпись слишком длинная. Максимум: {MAX_CAPTION_LENGTH} символов.")
+        return
+
+    file = media_object(message, content_type)
+    file_size = getattr(file, "file_size", None)
+    if file_size and file_size > MAX_MEDIA_SIZE_BYTES:
+        await message.answer("Файл слишком большой. Максимальный размер: 50 МБ.")
+        return
+
+    media_group_id = message.media_group_id
+    if recently_sent(message.from_user.id, media_group_id):
         await message.answer(f"Подожди {RATE_LIMIT_SECONDS} секунд перед следующим сообщением.")
         return
 
     try:
-        await message.bot.send_message(
-            chat_id=session["owner_telegram_id"],
-            text=f"📨 Анонимное сообщение:\n\n{message.text}",
+        sent_messages = await send_anonymous_message(
+            message, session["owner_telegram_id"], content_type
         )
-    except (TelegramForbiddenError, TelegramBadRequest):
+    except (TelegramForbiddenError, TelegramBadRequest, TelegramAPIError, ValueError):
         await message.answer("Не удалось доставить сообщение: получатель отключил бота или ссылку.")
         clear_session(message.from_user.id)
         return
 
-    save_message(session["link_id"], message.from_user.id, session["owner_telegram_id"], message.text)
+    file_id = getattr(file, "file_id", None)
+    file_unique_id = getattr(file, "file_unique_id", None)
+    metadata = {}
+    if content_type == "audio":
+        metadata = {"duration": message.audio.duration, "performer": message.audio.performer, "title": message.audio.title}
+    elif content_type in {"video", "animation"}:
+        media = getattr(message, content_type)
+        metadata = {"duration": media.duration, "width": media.width, "height": media.height}
+    elif content_type == "photo":
+        metadata = {"width": file.width, "height": file.height}
+
+    save_message(
+        session["link_id"],
+        message.from_user.id,
+        session["owner_telegram_id"],
+        content_type=content_type,
+        text=message.text or "",
+        file_id=file_id,
+        file_unique_id=file_unique_id,
+        caption=caption,
+        file_name=getattr(file, "file_name", None),
+        mime_type=getattr(file, "mime_type", None),
+        media_group_id=media_group_id,
+        metadata=metadata,
+        telegram_message_id=sent_messages[-1].message_id,
+    )
     await message.answer("Сообщение отправлено анонимно.")
 
 
